@@ -1,6 +1,7 @@
 (() => {
   'use strict';
 
+  // ---------- CONFIG ----------
   const CONFIG = {
     messageTemplates: [
       'sent ✅',
@@ -10,16 +11,16 @@
     ],
     minDelay: 3000,
     maxDelay: 8000,
-    maxReplies: 10,
+    maxRepliesPerRun: 30,        // per-run throttle; NOT a hard limit overall
     emailRegex: /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i,
     stopOnError: true,
     dryRun: false
   };
 
-  let repliesCount = 0;
-  let isRunning = false;
-  let isPaused = false;
-  const seen = new Set();
+  // ---------- STATE ----------
+  let running = false;
+  let paused = false;
+  let repliedThisRun = 0;
 
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
   const rand = (a,b)=>Math.floor(Math.random()*(b-a+1))+a;
@@ -29,10 +30,54 @@
     const p = t==='error'?'❌':t==='success'?'✅':'ℹ️';
     console.log(`${p} Auto-Reply: ${m}`);
   };
+
   const containsEmail = (s='')=>CONFIG.emailRegex.test(s);
 
+  // ---------- KEY NORMALIZATION ----------
+  // Extract the stable URN if present, else fall back to comment id; trim/compact whitespace.
+  function normalizeStoredKey(k='') {
+    const s = String(k);
+    const urnMatch = s.match(/urn:li:comment:\([^)]*\)/); // grab just the URN portion
+    if (urnMatch) return urnMatch[0];
+    return s.replace(/\s+/g, ' ').trim();
+  }
+
+  function stableCommentKey(el) {
+    const urn = el.getAttribute('data-urn');                         // best
+    if (urn) return normalizeStoredKey(urn);
+    const cid = el.getAttribute('data-comment-id') || el.getAttribute('data-id') || el.id || '';
+    if (cid) return cid.trim();
+    // ultimate fallback: compacted first 80 chars of text (rare)
+    return (el.textContent || '').replace(/\s+/g, ' ').trim().slice(0,80);
+  }
+
+  // ---------- PROGRESS (PERSISTED) ----------
+  const STORAGE_PREFIX = 'li-auto-reply.progress:';
+  function getPostKey(){
+    const urnEl = document.querySelector('[data-urn*="activity"]');
+    const urn = urnEl?.getAttribute('data-urn') || '';
+    return STORAGE_PREFIX + (urn || location.pathname);
+  }
+  function loadProgress(){
+    try {
+      const raw = localStorage.getItem(getPostKey());
+      const obj = raw ? JSON.parse(raw) : { processed: [] };
+      // migrate any legacy keys to stable form
+      const migrated = (obj.processed || []).map(normalizeStoredKey);
+      return { processed: Array.from(new Set(migrated)) };
+    } catch {
+      return { processed: [] };
+    }
+  }
+  function saveProgress(progress){
+    try { localStorage.setItem(getPostKey(), JSON.stringify(progress)); } catch {}
+  }
+  const progress = loadProgress();
+  const processedSet = new Set(progress.processed || []);
+
+  // ---------- HELPERS ----------
   async function waitWhilePaused(){
-    while(isPaused){ await sleep(500); }
+    while (paused) { await sleep(500); }
   }
 
   async function expandAll() {
@@ -57,9 +102,9 @@
 
   function findComments(){
     const cands = [
-      '[data-id*="comment"]',
-      '[data-urn*="comment"]',
+      '[data-urn*="comment"]',      // prefer URN-backed nodes
       '[data-comment-id]',
+      '[data-id*="comment"]',
       'div[role="comment"]',
       '.comments-comment-item',
       '.feed-shared-comment'
@@ -72,10 +117,8 @@
   }
 
   function keyFor(el){
-    const id = el.getAttribute('data-id') || el.id || '';
-    const who = el.querySelector('[data-test-reusable-actor__name],[aria-label*="Author"],[data-view-name*="actor-name"]')?.textContent?.trim() || '';
-    const snip = (el.textContent||'').slice(0,60).trim();
-    return `${id}|${who}|${snip}`;
+    // Use the new stable key so it matches backfilled storage
+    return stableCommentKey(el);
   }
 
   function getCommentText(el){
@@ -129,14 +172,13 @@
     return list[list.length-1] || null;
   }
 
-  // ⬇️ UPDATED: scope submit to editor container; match Reply/Post and the comments-comment-box__submit-button class
   function findSubmitButtonNear(editorEl){
     const container = editorEl.closest(
       '.comments-comment-box, .comments-comment-card, form, .comments-comment-item'
     ) || document;
 
     const sels = [
-      'button[class*="comments-comment-box__submit-button"]', // class from your screenshot
+      'button[class*="comments-comment-box__submit-button"]', // common in reply UI
       'button[aria-label*="reply" i]',
       'button[aria-label*="post reply" i]',
       'button[data-control-name*="post_comment" i]',
@@ -153,23 +195,19 @@
         const enabled = !b.disabled && b.getAttribute('aria-disabled')!=='true';
         const visible = b.offsetParent!==null;
         const looksRight = aria.includes('reply') || aria.includes('post') || txt==='reply' || txt==='post' || txt.includes('reply') || txt.includes('post');
-        if (visible && enabled && looksRight) {
-          log(`Using submit button: ${b.id || '(no id)'} | classes: ${b.className}`);
-          return b;
-        }
+        if (visible && enabled && looksRight) return b;
       }
     }
     return null;
   }
 
-  // ⬇️ UPDATED: append text (keep @mention), place caret at end and insert
+  // Append (preserve @mention)
   async function appendIntoEditor(editorEl, text){
     editorEl.scrollIntoView({behavior:'smooth', block:'center'});
-    await sleep(250);
-
+    await sleep(200);
     editorEl.focus();
 
-    // Move caret to end
+    // place caret at end
     const range = document.createRange();
     range.selectNodeContents(editorEl);
     range.collapse(false);
@@ -177,20 +215,17 @@
     sel.removeAllRanges();
     sel.addRange(range);
 
-    // Ensure there is a space before appending if needed
     const lastChar = (editorEl.textContent || '').slice(-1);
     const toInsert = (lastChar && !/\s/.test(lastChar) ? ' ' : ' ') + text;
 
     const ok = document.execCommand('insertText', false, toInsert);
     if (!ok){
       editorEl.dispatchEvent(new InputEvent('beforeinput', {inputType:'insertText', data:toInsert, bubbles:true}));
-      // fallback direct mutation
       editorEl.textContent = (editorEl.textContent || '') + toInsert;
       editorEl.dispatchEvent(new Event('input', {bubbles:true}));
       editorEl.dispatchEvent(new KeyboardEvent('keyup', {bubbles:true, key:' '}));
     }
-
-    await sleep(250);
+    await sleep(200);
   }
 
   async function replyToComment(commentEl, message){
@@ -198,16 +233,11 @@
       commentEl.scrollIntoView({behavior:'smooth', block:'center'});
       await sleep(300);
 
-      const replyBtn = findReplyButton(commentEl);
-      if (!replyBtn){ log('Reply button not found', 'error'); return false; }
+      const btn = findReplyButton(commentEl);
+      if (!btn){ log('Reply button not found', 'error'); return false; }
 
-      if (CONFIG.dryRun){
-        replyBtn.style.outline='2px solid orange';
-        log('DRY-RUN: would click Reply');
-      } else {
-        log('Clicking Reply…');
-        replyBtn.click();
-      }
+      if (CONFIG.dryRun){ btn.style.outline='2px solid orange'; log('DRY-RUN: would click Reply'); }
+      else { btn.click(); }
 
       await sleep(700);
       await waitWhilePaused();
@@ -219,91 +249,119 @@
         editor.style.outline='2px solid dodgerblue';
         log(`DRY-RUN: would append "${message}"`);
       } else {
-        log(`Appending: "${message}"`);
         await appendIntoEditor(editor, message);
-
         const submit = findSubmitButtonNear(editor);
-        if (!submit){ log('Submit/Reply button not found near editor', 'error'); return false; }
-
-        log(`Submitting reply…`);
+        if (!submit){ log('Submit/Reply button not found', 'error'); return false; }
         submit.click();
       }
 
-      await sleep(1200);
+      await sleep(1000);
       return true;
     } catch(e){
-      log(`Error while replying: ${e?.message || e}`, 'error');
+      log(`Reply error: ${e?.message||e}`, 'error');
       return false;
     }
   }
 
-  async function processComments(){
-    if (isRunning){ log('Script already running', 'error'); return; }
-    isRunning = true;
+  async function process(){
+    if (running){ log('Already running', 'error'); return; }
+    running = true;
 
     try{
-      log('Expanding threads…');
+      // Save migrated set immediately (so UI reflects normalized keys)
+      progress.processed = Array.from(processedSet);
+      saveProgress(progress);
+
       await expandAll();
+      let comments = findComments();
+      log(`Visible comments: ${comments.length}`);
 
-      const comments = findComments();
-      log(`Found ${comments.length} visible comments`);
+      if (!comments.length){ log('No comments found on this page.', 'error'); return; }
 
-      if (!comments.length){
-        log('No comments found on this page.', 'error');
-        return;
-      }
-
-      for (let i=0; i<comments.length && repliesCount<CONFIG.maxReplies; i++){
+      for (let i=0; i<comments.length && repliedThisRun<CONFIG.maxRepliesPerRun; i++){
         await waitWhilePaused();
 
         const c = comments[i];
-        const k = keyFor(c);
-        if (seen.has(k)) continue;
-        seen.add(k);
+        const key = keyFor(c);
+        if (processedSet.has(key)) {
+          // already processed (either backfilled or this run) — skip
+          continue;
+        }
 
         const text = getCommentText(c);
-        const preview = (text||'').slice(0,80).replace(/\s+/g,' ');
-        log(`Analyzing #${i+1}: "${preview}…"`);
-        if (!text){ log('No readable text — skip'); continue; }
+        if (!text){ continue; }
+        if (!containsEmail(text)){ continue; }
 
-        if (!containsEmail(text)){ log('No email — skip'); continue; }
-        if (hasOwnReply(c)){ log('Already replied — skip'); continue; }
+        // If you already replied manually (detected), mark as processed and skip
+        if (hasOwnReply(c)){
+          processedSet.add(key);
+          progress.processed = Array.from(processedSet);
+          saveProgress(progress);
+          continue;
+        }
 
         const msg = randomTemplate();
         const ok = await replyToComment(c, msg);
         if (ok){
-          repliesCount++;
-          log(`Replied (${repliesCount}/${CONFIG.maxReplies})`, 'success');
+          repliedThisRun++;
+          // Mark as processed (normalized key) and persist
+          processedSet.add(key);
+          progress.processed = Array.from(processedSet);
+          saveProgress(progress);
+
           const d = randomDelay();
-          log(`Cooling down ${(d/1000).toFixed(1)}s…`);
+          log(`Replied (${repliedThisRun}/${CONFIG.maxRepliesPerRun}). Cooling down ${(d/1000).toFixed(1)}s…`, 'success');
           await sleep(d);
         } else if (CONFIG.stopOnError){
-          log('Stopping due to error (stopOnError=true)', 'error');
+          log('Stopping (stopOnError=true)', 'error');
           break;
         }
       }
 
-      log(`Done. Total replies: ${repliesCount}`, 'success');
+      log(`Run complete. Replied this run: ${repliedThisRun}. Total processed (saved): ${processedSet.size}`, 'success');
     } catch(e){
-      log(`Fatal: ${e?.message || e}`, 'error');
+      log(`Fatal: ${e?.message||e}`, 'error');
     } finally {
-      isRunning = false;
+      running = false;
     }
   }
 
-  // Controls
-  window.pauseLinkedInReply = function(){ isPaused = !isPaused; log(isPaused?'Paused':'Resumed'); };
-  window.stopLinkedInReply = function(){ isRunning=false; isPaused=false; log('Stop requested; exiting after current step.'); };
-  window.addEventListener('keydown', e => {
-    if (e.key.toLowerCase()==='p') window.pauseLinkedInReply();
-    if (e.key.toLowerCase()==='s') window.stopLinkedInReply();
+  // ---------- PUBLIC CONTROLS ----------
+  window.liReply = {
+    pause(){ paused = !paused; log(paused?'Paused':'Resumed'); },
+    stop(){ running=false; paused=false; log('Stop requested; will exit after current step'); },
+    setMax(n){ if (Number.isFinite(n) && n>0){ CONFIG.maxRepliesPerRun = n; log(`maxRepliesPerRun set to ${n}`); } },
+    stats(){
+      const k = getPostKey();
+      const total = processedSet.size;
+      log(`PostKey: ${k}`);
+      log(`Processed total (persisted): ${total}`);
+      log(`This run replied: ${repliedThisRun}`);
+      return { postKey:k, processedTotal: total, repliedThisRun };
+    },
+    reset(){
+      localStorage.removeItem(getPostKey());
+      processedSet.clear?.();
+      while(processedSet.size) {
+        const first = processedSet.values().next().value;
+        if (first===undefined) break;
+        processedSet.delete(first);
+      }
+      progress.processed = [];
+      log('Progress for this post cleared.');
+    }
+  };
+
+  // Keyboard shortcuts: P pause/resume, S stop
+  window.addEventListener('keydown', (e)=>{
+    if (e.key.toLowerCase()==='p') window.liReply.pause();
+    if (e.key.toLowerCase()==='s') window.liReply.stop();
   });
 
-  // Start
-  log('Loaded. Controls: pauseLinkedInReply() / stopLinkedInReply() or press P / S');
+  // ---------- START ----------
+  log('Loaded. Controls: liReply.pause() / liReply.stop() / liReply.setMax(n) / liReply.stats() / liReply.reset()  (P=Pause, S=Stop)');
+  log(`Delay: ${CONFIG.minDelay/1000}-${CONFIG.maxDelay/1000}s | Per-run cap: ${CONFIG.maxRepliesPerRun} (raise with liReply.setMax(n))`);
   log(`Templates: ${CONFIG.messageTemplates.join(' | ')}`);
-  log(`Delay: ${CONFIG.minDelay/1000}-${CONFIG.maxDelay/1000}s  Max: ${CONFIG.maxReplies}`);
   log(`Dry-run: ${CONFIG.dryRun ? 'ON' : 'OFF'}`);
-  log('Starting in 3s…');
-  setTimeout(processComments, 3000);
+  setTimeout(process, 1200);
 })();
