@@ -7,13 +7,15 @@ These scripts automate interactions on LinkedIn and may violate LinkedIn’s Ter
 
 ## How It Works: Local Storage as a Hashmap
 
-At the core, both scripts use your browser’s **`localStorage`** as a simple hashmap to track progress:
+At the core, both scripts use your browser’s **`localStorage`** as a simple hashmap to track progress.
 
-- **Keys**  
-  Each LinkedIn post gets its own unique key, based on the post’s URN:
+### Keys
+Each LinkedIn post gets its own unique key, based on the post’s URN.
 
-- **Values**  
-  The value is a JSON object with a `processed` array that stores comment identifiers (comment URNs):
+---
+
+### Values
+The value is a JSON object with a `processed` array that stores comment identifiers (comment URNs):
 
 ```json
 {
@@ -22,10 +24,32 @@ At the core, both scripts use your browser’s **`localStorage`** as a simple ha
     "urn:li:comment:(activity:<post-id>,<comment-id-2>)"
   ]
 }
+````
 
-- **Behavior**
+---
 
+### Behavior
 
+* **Backfill (`backfill.js`)**
+  Scans comments you’ve already replied to and inserts their URNs into this hashmap.
+
+* **Auto-reply (`auto_reply.js`)**
+  Checks this hashmap before acting:
+
+  * If a comment URN is already in the hashmap → **skip it**.
+  * If new → **reply/like**, then insert its URN into the hashmap.
+
+---
+
+### Why This Approach?
+
+* **Persistence** – Progress survives refreshes, tab closes, and browser restarts.
+* **Efficiency** – Lookups are constant time **O(1)** since URNs are stored in a Set in memory and synced back to `localStorage`.
+* **Isolation** – Each post is tracked separately by its URN-based key, so campaigns don’t interfere with one another.
+
+---
+
+In practice, the hashmap acts as the script’s memory—ensuring we never double-reply and can always resume safely.
 
 
 ## Overview
@@ -111,5 +135,4 @@ We tested two styles:
 
 ## Storage Keys
 
-- Keys are always prefixed:
-```
+- Keys are always prefixed
